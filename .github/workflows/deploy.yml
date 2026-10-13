@@ -1,33 +1,82 @@
-name: Deploy Next.js to cPanel
+name: Deploy to RupaCloud (Next.js)
 
 on:
   push:
-    branches:
-      - migrate-to-mysql # Ganti dengan nama branch yang Anda inginkan (misal: staging, dev, atau production)
+    branches: [main]
 
 jobs:
-  web-deploy:
-    name: Deploy
+  deploy:
+    name: Auto-Deploy to Container
     runs-on: ubuntu-latest
-
     steps:
-      # 1. Checkout kode dari GitHub
-      - name: Get latest code
+      - name: Checkout Code
         uses: actions/checkout@v4
 
-      # 2. Install dependencies dan Build project Next.js
-      - name: Install dependencies
-        run: |
-          npm ci
-
-      # 4. Upload file hasil build ke cPanel via FTP
-      - name: Sync files to cPanel
-        uses: SamKirkland/FTP-Deploy-Action@v4.3.5
+      - name: SSH to RupaCloud Container & Deploy
+        uses: appleboy/ssh-action@v1.0.0
+        env:
+          APP_ENV_CONTENT: ${{ secrets.APP_ENV }}
         with:
-          server: ${{ secrets.FTP_SERVER }}
-          username: ${{ secrets.FTP_USERNAME }}
-          password: ${{ secrets.FTP_PASSWORD }}
-          # Tentukan file apa saja yang perlu di-upload. 
-          # Jika Anda menggunakan output 'export' (Static HTML), arahkan ke folder 'out'.
-          # Jika menggunakan SSR standar, Anda perlu mengupload seluruh file termasuk .next, public, package.json, dll.
-          local-dir: ./
+          host: ${{ secrets.SERVER_IP }}
+          port: ${{ secrets.SERVER_PORT || 22 }}
+          username: root
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          timeout: 60s
+          command_timeout: 30m
+          envs: APP_ENV_CONTENT
+          script: |
+            # 1. Pastikan folder ~/app tersedia dan clone/pull dari branch main
+            set -e
+            export GIT_TERMINAL_PROMPT=0
+            TARGET_REPO="${{ github.repository }}"
+            CURRENT_REPO="$(cd ~/app 2>/dev/null && git config --get remote.origin.url 2>/dev/null || true)"
+            if [ ! -d ~/app/.git ] || ! echo "$CURRENT_REPO" | grep -q "$TARGET_REPO"; then
+              rm -rf ~/app
+              git clone --depth 1 -b main https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git ~/app
+              cd ~/app
+            else
+              cd ~/app
+              git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
+              git fetch --depth 1 origin main
+              git checkout -B main FETCH_HEAD
+              git reset --hard FETCH_HEAD
+              git clean -fd
+            fi
+            # 2. Inject environment variables dari GitHub Secret (APP_ENV)
+            if [ -n "$APP_ENV_CONTENT" ]; then
+              echo "$APP_ENV_CONTENT" > .env
+            fi
+            # 3. Install dependensi
+            npm install
+            if [ -f prisma/schema.prisma ] || grep -q 'prisma' package.json 2>/dev/null; then
+              npx prisma generate 2>/dev/null || true
+            fi
+            # 4. Build application
+            export NODE_OPTIONS="--max-old-space-size=1200"
+            NODE_OPTIONS='--max-old-space-size=1024' npm run build
+            # 5. Konfigurasi Nginx reverse proxy ke port 3000 (jika Nginx terpasang)
+            if which nginx >/dev/null 2>&1; then
+              cat << 'NGINX_EOF' > /etc/nginx/sites-available/default
+            server {
+                listen 80 default_server;
+                listen [::]:80 default_server;
+                server_name _;
+                location / {
+                    proxy_pass http://127.0.0.1:3000;
+                    proxy_http_version 1.1;
+                    proxy_set_header Upgrade $http_upgrade;
+                    proxy_set_header Connection 'upgrade';
+                    proxy_set_header Host $host;
+                    proxy_set_header X-Real-IP $remote_addr;
+                    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                    proxy_set_header X-Forwarded-Proto $scheme;
+                    proxy_cache_bypass $http_upgrade;
+                }
+            }
+            NGINX_EOF
+              nginx -t 2>/dev/null && systemctl reload nginx 2>/dev/null || true
+            fi
+            # 6. Menjalankan / merestart aplikasi
+            pm2 delete app 2>/dev/null || true
+            pm2 delete app 2>/dev/null || true; pm2 start npm --name app -- start -- -p 3000
+            pm2 save 2>/dev/null || true
